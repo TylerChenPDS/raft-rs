@@ -324,6 +324,7 @@ impl<T: Storage> RawNode<T> {
     }
 
     /// Propose proposes data be appended to the raft log.
+    /// Propose	提议写入数据到日志中，可能会返回错误。
     pub fn propose(&mut self, context: Vec<u8>, data: Vec<u8>) -> Result<()> {
         let mut m = Message::new();
         m.set_msg_type(MessageType::MsgPropose);
@@ -336,6 +337,7 @@ impl<T: Storage> RawNode<T> {
     }
 
     /// ProposeConfChange proposes a config change.
+    /// 提交配置变更
     #[cfg_attr(feature = "cargo-clippy", allow(clippy::needless_pass_by_value))]
     pub fn propose_conf_change(&mut self, context: Vec<u8>, cc: ConfChange) -> Result<()> {
         let data = protobuf::Message::write_to_bytes(&cc)?;
@@ -381,6 +383,7 @@ impl<T: Storage> RawNode<T> {
     }
 
     /// Step advances the state machine using the given message.
+    /// 驱动状态机使用应用给定的状态
     pub fn step(&mut self, m: Message) -> Result<()> {
         // ignore unexpected local messages receiving over network
         if is_local_msg(m.get_msg_type()) {
@@ -451,6 +454,9 @@ impl<T: Storage> RawNode<T> {
 
     /// Advance notifies the RawNode that the application has applied and saved progress in the
     /// last Ready results.
+    ///
+    /// Advance通知RawNode应用程序已经应用并保存了最后一个Ready结果中的进度，也就是raft知道了已经将commit_entries 应用到了状态机
+    /// 知道了已经将entries 持久化存储了，知道了。。。反正知道了很多
     pub fn advance(&mut self, rd: Ready) {
         self.advance_append(rd);
         let commit_idx = self.prev_hs.get_commit();

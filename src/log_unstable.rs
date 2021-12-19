@@ -33,6 +33,8 @@ use eraftpb::{Entry, Snapshot};
 /// Note that unstable.offset may be less than the highest log
 /// position in storage; this means that the next write to storage
 /// might need to truncate the log before persisting unstable.entries.
+///
+/// 顾名思义，unstable数据结构用于还没有被用户层持久化的数据
 #[derive(Debug, PartialEq, Default)]
 pub struct Unstable {
     /// The incoming unstable snapshot, if any.
