@@ -42,23 +42,131 @@ message Snapshot {
 }
 
 enum MessageType {
+    // MsgHub被用做选举，如果一个节点是follower或者candidate状态，其tick 函数（在raft结构体中）被设置成tickElection。
+    // 如果一个follower或者candidate在election timeout超时之前没有收到任何的心跳，他将向自己的Step 方法传递‘MsgHub’消息，
+    // 然后变成（或者保持）candidate ，然后开启一场新的选举。
     MsgHup = 0;
+
+    // MsgBeat 是一个内部类型指示leader去发送心跳（心跳的类型为“MsgHeartbeat”）。
+    // 如果一个节点是leader，那么它的tick函数就是tickHeartbeat，并且触发leader周期性发送MsgHeartbeat消息给follower
     MsgBeat = 1;
+
+    // raft库的使用者向raft库propose数据时，最后会封装成这个类型的消息来进行提交，不同类型的节点处理还不尽相同。
+    // MsgProp 提议向他的日志条目增加数据。这是一种特殊的类型，将提议重定向给领导。
+    // 当MsgProp 传给leader 的Step方法时，leader首先会调用appendEntry方法，将日志条目加到本地，然后调用bcastAppend方法将这个日志发送给其他节点。
+    // 当MsgProp 传给candidate的时候，消息会被丢弃。（说明现在处于竞选状态，不能够处理这个请求）
+    // 当MsgProp 传给follower的时候，它会被存到接收者的邮箱里面。他会存下发送者id，然后通过rafthttp将其转发给leader
     MsgPropose = 2;
+
+    // MsgApp包含需要复制的日志条目，一个leader调用bcastAppend，会调用sendAppend，sendAppend会将需要复制的log封装成MsgApp类型。
+    // 当MsgApp被传递给candidate的Step方法的时候，candidate  会转换成follower，因为这个消息暗示者现在有一个合法的leader正在发送MsgApp消息。
+    // candidate和follower通过MsgAppResp来响应这个消息类型
     MsgAppend = 3;
+
+    // 在节点收到leader的MsgApp/MsgSnap消息时，可能出现leader上的数据与自身节点数据不一致的情况，
+    // 这种情况下会返回reject为true的MsgAppResp消息，同时rejectHint字段是本节点raft最后一条日志的索引ID。
+    // 而index字段则返回的是当前节点的日志索引ID，用于向leader汇报自己已经commit的日志数据ID，这样leader就知道下一次同步数据给这个节点时，
+    // 从哪条日志数据继续同步了。
+    // leader节点在收到MsgAppResp消息的处理流程大体如下（stepLeader函数中MsgAppResp case的处理流程）。
+    // 首先，收到节点的MsgAppResp消息，说明该节点是活跃的，因此保存节点状态的RecentActive成员置为true。
+    // 接下来，再根据msg.Reject的返回值，即节点是否拒绝了这次数据同步，来区分两种情况进行处理。
+    //
+    // msg.Reject为true的情况
+    // 如果msg.Reject为true，说明节点拒绝了前面的MsgApp/MsgSnap消息，根据msg.RejectHint成员回退leader上保存的关于该节点的日志记录状态。
+    // 比如leader前面认为从日志索引为10的位置开始向节点A同步数据，但是节点A拒绝了这次数据同步，同时返回RejectHint为2，
+    // 说明节点A告知leader在它上面保存的最大日志索引ID为2，这样下一次leader就可以直接从索引为2的日志数据开始同步数据到节点A。
+    // 而如果没有这个RejectHint成员，leader只能在每次被拒绝数据同步后都递减1进行下一次数据同步，显然这样是低效的。
+    // 1, 因为上面节点拒绝了这次数据同步，所以节点的状态可能存在一些异常，此时如果leader上保存的节点状态为ProgressStateReplicate，
+    // 那么将切换到ProgressStateProbe状态
+    // 2, 前面已经按照msg.RejectHint修改了leader上关于该节点日志状态的索引数据，接着再次尝试按照这个新的索引数据向该节点再次同步数据。
+    //
+    // msg.Reject为false的情况
+    // 这种情况说明这个节点通过了leader的这一次数据同步请求，这种情况下根据msg.Index来判断在leader中保存的该节点日志数据索引是否发生了更新，
+    // 如果发生了更新那么就说明这个节点通过了新的数据，这种情况下会做以下的几个操作。
+    // 1. 修改节点状态
+    // 如果该节点之前在ProgressStateProbe状态，说明之前处于探测状态，此时可以切换到ProgressStateReplicate，开始正常的接收leader的同步数据了。
+    // 如果之前处于ProgressStateSnapshot状态，即还在同步副本，说明节点之前可能落后leader数据比较多才采用了接收副本的状态。
+    // 这里还需要多做一点解释，因为在节点落后leader数据很多的情况下，可能leader会多次通过snapshot同步数据给节点，
+    // 而当 pr.Match >= pr.PendingSnapshot的时候，说明通过快照来同步数据的流程完成了，这时可以进入正常的接收同步数据状态了，
+    // 这就是函数Progress.needSnapshotAbort要做的判断。
+    // 如果之前处于ProgressStateReplicate状态，此时可以修改leader关于这个节点的滑动窗口索引，释放掉这部分数据索引，好让节点可以接收新的数据了。
+    // 2. 判断是否有新的数据可以提交（commit）了。
+    // 因为raft的提交数据的流程是这样的：首先节点将数据提议（propose）给leader，leader在将数据写入到自己的日志成功之后，
+    // 再通过MsgApp把这些提议的数据广播给集群中的其他节点，在某一条日志数据收到超过半数（qurom）的节点同意之后，
+    // 才认为是可以提交（commit）的。因此每次leader节点在收到一条MsgAppResp类型消息，同时msg.Reject又是false的情况下，
+    // 都需要去检查当前有哪些日志是超过半数的节点同意的，再将这些可以提交（commit）的数据广播出去。
+    // 而在没有数据可以提交的情况下，如果之前节点处于暂停状态，那么将继续向该节点同步数据。
+    // 3. 最后还要做一个跟leader迁移相关的操作。
+    // 如果该消息节点是准备迁移过去的新leader节点（raft.leadTransferee == msg.From），而且此时该节点上的Match索引已经跟旧的leader的日志最大索引一致，
+    // 说明新旧节点的日志数据已经同步，可以正式进行集群leader迁移操作了。
     MsgAppendResponse = 4;
+
+    // MsgVote用于在选举的时候请求投票。
+    // 当一个节点是follower或者candidate的时候，并且此时由于超时收到了自己传递给自己的MsgHub方法，节点将会调用campaign方法，发起竞选以使自己成为领导者。
+    // 一旦campaign方法被调用，节点就会变成candidate然后发送MsgVote到其他节点请求投票。
+    // 当这个消息传递给leader或者candidate，但是这个消息的term小于leader或者candidate的term，MsgVote消息将会被拒绝，
+    // 如果leader或者candidate接受了更高term的MsgVote消息，他们将会变成follower。
+    // 当MsgVote消息传递给follower的时候，他会首先判断发送者的任期大于自己的任期，或者发送者任期等于自己任期但是last commit index 大于接收者的，
+    // 此时接收者将会把票投给发送者。
     MsgRequestVote = 5;
+    // 当MsgVoteResp传递给candidate的时候，candidate会计算它赢得了多少张选票，如果超过半数，他将成为leader，然后调用bcastAppend。
+    // 如果没有收到半数投票，他将转变成follower
     MsgRequestVoteResponse = 6;
+
+    // MsgApp，是leader节点用于向集群中其他节点同步数据的。
+    // MsgSnap消息做的事情其实跟MsgApp消息是一样的：都是用于leader向follower同步数据。
+    // 实际上对于leader而言，向某个节点同步数据这个操作，都封装在raft.sendAppend函数中，至于具体用的哪种消息类型由这个函数内部实现。
+    // 如果这个日志文件不停的增长，显然是不能接受的。因此，在某些时刻，节点会将日志数据进行压缩处理，就是把当前的数据写入到一个快照文件中。
+    //
+    // 这个消息是为了安装快照。当一个节点刚刚成为leader 或者一个leader收到了MsgProp消息，他会调用bcastAppend方法，
+    // bcastAppend调用sendAppend将消息发送到每一个follower。
+    // 在sendAppend方法中，如果一个leader没有得到任期或者日志，leader将会发送MsgSnap消息，请求日志。
     MsgSnapshot = 7;
+
+    // 这个消息用于leader发送心跳。这条消息会被发送到leader的邮箱
+    // 当消息传递给candidate并且消息的term大于candidate的term的时候，candidate会转成follower，并且根据心跳中的commit跟新自己的提交索引
+    // 当消息传递给follower的step方法的时候，并且消息的term大于follower 的term的时候，follower将会更新leaderId
+    // 当这个消息传递给leader的step方法的时候，leader知道对应的跟随着回应了，当且仅当leader的last commited index 大于follower的Match index的时候，
+    // leader才会调用sendAppend方法。
     MsgHeartbeat = 8;
     MsgHeartbeatResponse = 9;
+
+    // “MsgUnreachable”告诉该请求(消息)未送达。
+    // 'MsgUnreachable'传递给leader的Step方法，leader发现发送这个'MsgUnreachable'的跟随者是不可达的，通常意味着'MsgApp'丢失了。
+    // 当follower的进度状态被复制后，leader将其设置回去进行探测。
+    //
+    // 仅leader才处理这类消息，leader如果判断该节点此时处于正常接收数据的状态（ProgressStateReplicate），那么就切换到探测状态。
     MsgUnreachable = 10;
+
+    // 这个消息将会告知快照安装的结果。当一个follower拒绝了MsgSnap，这表明MsgSnap由于网络问题失败了。
+    // leader将follower的progress设置为probe。
     MsgSnapStatus = 11;
+
+    // leader的定时器函数，在超过选举时间时，如果当前打开了raft.checkQuorum开关，那么leader将给自己发送一条MsgCheckQuorum消息，
+    // 对该消息的处理是：检查集群中所有节点的状态，如果超过半数的节点都不活跃了，那么leader也切换到follower状态。
     MsgCheckQuorum = 12;
+
+    // 这类消息follower将转发给leader处理，因为follower并没有修改集群配置状态的权限。
+    // leader在收到这类消息时，是以下的处理流程。
+    // 1. 如果当前的raft.leadTransferee成员不为空，说明有正在进行的leader迁移流程。
+    // 此时会判断是否与这次迁移是同样的新leader ID，如果是则忽略该消息直接返回；否则将终止前面还没有完毕的迁移流程。
+    // 2. 如果这次迁移过去的新节点，就是当前的leader ID，也直接返回不进行处理。
+    // 3. 到了这一步就是正式开始这一次的迁移leader流程了，一个节点能成为一个集群的leader，
+    // 其必要条件是上面的日志与当前leader的一样多，所以这里会判断是否满足这个条件，
+    // 如果满足那么发送MsgTimeoutNow消息给新的leader通知该节点进行leader迁移，否则就先进行日志同步操作让新的leader追上旧leader的日志数据。
     MsgTransferLeader = 13;
+
+    // 新的leader节点，在还未迁移之前仍然是follower，在收到这条消息后，就可以进行迁移了，
+    // 此时会调用前面分析MsgVote时说过的campaign函数，传入的参数是campaignTransfer，表示这是一次由于迁移leader导致的选举流程。
     MsgTimeoutNow = 14;
+
+    // 和读一致性相关的消息
     MsgReadIndex = 15;
     MsgReadIndexResp = 16;
+
+    // 这两条消息被用于可选的两阶段选举协议（two-phase election）。
+    // 当Config.PreVote为true的时候，一场预选举将会被举办，但是不会有节点会增加他们的term除非预选举表明参与的节点会获胜。
+    // 当一个分区的节点重新加入集群的时候，这将最小化中断时间，不会使得领导者瞬间退位。
     MsgRequestPreVote = 17;
     MsgRequestPreVoteResponse = 18;
 }

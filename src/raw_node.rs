@@ -94,27 +94,36 @@ pub fn is_empty_snap(s: &Snapshot) -> bool {
 /// Ready encapsulates the entries and messages that are ready to read,
 /// be saved to stable storage, committed or sent to other peers.
 /// All fields in Ready are read-only.
+/// Ready封装了准备读取、保存到稳定存储、提交或发送到其他对等节点的条目和消息。“Ready”中的所有字段都是只读的。
 #[derive(Default, Debug, PartialEq)]
 pub struct Ready {
+    /// 软状态，软状态易变且不需要保存在日志中的状态数据，包括：集群leader、节点的当前状态
     ss: Option<SoftState>,
 
+    /// 硬状态，与软状态相反，需要写入持久化存储中，包括：节点当前Term、Vote、Commit
     hs: Option<HardState>,
 
+    /// 用于读一致性的数据
     read_states: Vec<ReadState>,
 
+    /// 在向其他集群发送消息之前需要先写入持久化存储的日志数据
     entries: Vec<Entry>,
 
+    /// 需要写入持久化存储中的快照数据
     snapshot: Snapshot,
 
     /// CommittedEntries specifies entries to be committed to a
     /// store/state-machine. These have previously been committed to stable
     /// store.
+    /// 需要输入到状态机中的数据，这些数据之前已经被保存到持久化存储中了
     pub committed_entries: Option<Vec<Entry>>,
 
     /// Messages specifies outbound messages to be sent AFTER Entries are
     /// committed to stable storage.
     /// If it contains a MsgSnap message, the application MUST report back to raft
-    /// when the snapshot has been received or has failed by calling ReportSnapshot.
+    /// when the snapshot has been received or has failed by calling ReportSnapshot. <br/>
+    /// 在entries被写入持久化存储中以后，需要发送出去的数据。
+    /// 如果它包含MsgSnap消息，应用程序必须在接收到快照或调用ReportSnapshot失败时向raft报告。
     pub messages: Vec<Message>,
 
     must_sync: bool,
@@ -209,7 +218,9 @@ impl Ready {
 
 /// RawNode is a thread-unsafe Node.
 /// The methods of this struct correspond to the methods of Node and are described
-/// more fully there.
+/// more fully there. <br/>
+/// 通过RawNode结构体实现的接口与raft库进行交互，涉及数据变更的核心数据结构就是Ready结构体
+/// raft库对外提供一个RawNode，这也是应用层唯一需要与这个raft库直接打交道的结构体
 pub struct RawNode<T: Storage> {
     /// The internal raft state.
     pub raft: Raft<T>,
@@ -294,11 +305,18 @@ impl<T: Storage> RawNode<T> {
     ///
     /// Returns true to indicate that there will probably be some readiness which
     /// needs to be handled.
+    ///
+    /// Tick将内部逻辑时钟提前一个Tick。应用层每次tick时需要调用该函数，将会由这里驱动raft的一些操作比如选举等。
+    /// 至于tick的单位是多少由应用层自己决定，只要保证是恒定时间都会来调用一次就好了。
+    ///
+    /// 返回true，表示可能会有一些准备工作需要处理。
     pub fn tick(&mut self) -> bool {
         self.raft.tick()
     }
 
     /// Campaign causes this RawNode to transition to candidate state.
+    ///
+    /// 调用该函数将驱动节点进入候选人状态，进而将竞争leader。
     pub fn campaign(&mut self) -> Result<()> {
         let mut m = Message::new();
         m.set_msg_type(MessageType::MsgHup);
