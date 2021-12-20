@@ -44,3 +44,7 @@ path = "examples/single_mem_node/main.rs"
 [[example]]
 name = "five_mem_node"
 path = "examples/five_mem_node/main.rs"
+
+[[example]]
+name = "kv_example"
+path = "examples/kv_example.rs"

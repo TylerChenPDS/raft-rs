@@ -46,9 +46,12 @@ pub struct RaftState {
     pub hard_state: HardState,
     /// Records the current node IDs like `[1, 2, 3]` in the cluster. Every Raft node must have a unique ID in the cluster;
     pub conf_state: ConfState,
+
     /// If this peer is in the middle of a membership change (The period between
     /// `BeginMembershipChange` and `FinalizeMembershipChange`) this will hold the final desired
     /// state.
+    ///
+    /// 如果peer在成员变更的中间状态，这个将会保持为最终想要的状态。中间状态指的是在`BeginMembershipChange` 和 `FinalizeMembershipChange`之间的状态
     #[get = "pub"]
     #[set]
     pending_conf_state: Option<ConfState>,
@@ -65,30 +68,59 @@ pub struct RaftState {
 /// If any Storage method returns an error, the raft instance will
 /// become inoperable and refuse to paticipate in elections; the
 /// application is responsible for cleanup and recovery in this case.
+///
+/// storage 里面存了关于当前raft的所有信息，包括Raft Log，commit index， vote for 等等
+///
+/// 请注意如果没有日志的时候，如果想要得到在first_index()-1 处的term的情况。解决这个问题可以使用一个dummy log entry 如：[`entries: vec![Entry::new()]`]
+///
+/// 如果Storage方法返回错误，那么raft实例将会变得不可操作并且拒绝参与选举；这种情况应用负责清理和恢复。
 pub trait Storage {
     /// `initial_state` is called when Raft is initialized. This interface will return a `RaftState` which contains `HardState` and `ConfState`;
+    ///
+    /// 返回当前的初始状态，其中包括硬状态（HardState）以及配置（里面存储了集群中有哪些节点）。
     fn initial_state(&self) -> Result<RaftState>;
+
     /// Returns a slice of log entries in the range `[low, high)`.
     /// max_size limits the total size of the log entries returned, but
     /// entries returns at least one entry if any.
+    ///
+    /// 传入起始和结束索引值，以及最大的尺寸，返回索引范围在这个传入范围以内并且不超过大小的日志条目数组。
     fn entries(&self, low: u64, high: u64, max_size: u64) -> Result<Vec<Entry>>;
+
     /// Returns the term of entry idx, which must be in the range
     /// [first_index()-1, last_index()]. The term of the entry before
     /// first_index is retained for matching purpose even though the
     /// rest of that entry may not be available.
+    ///
+    /// 传入日志索引idx，返回这条日志对应的任期号。找不到的情况下error返回值不为空，
+    /// 其中当返回ErrCompacted表示传入的索引数据已经找不到，说明已经被压缩成快照数据了；
+    /// 返回ErrUnavailable：表示传入的索引值大于当前的最大索引。
+    ///
+    /// idx∈[first_index()-1, last_index()]
     fn term(&self, idx: u64) -> Result<u64>;
+
     /// Returns the index of the first log entry that is
     /// possible available via entries (older entries have been incorporated
     /// into the latest snapshot; if storage only contains the dummy entry the
     /// first log entry is not available).
+    ///
+    /// 返回entries里面第一个日志条目的索引（更老的entries 可能被合并到最新的快照里面了），
+    /// 如果storage 只有dummy entry，则first log entry不可用
     fn first_index(&self) -> Result<u64>;
+
     /// The index of the last entry in the log.
     fn last_index(&self) -> Result<u64>;
+
     /// Returns the most recent snapshot.
     ///
     /// If snapshot is temporarily unavailable, it should return SnapshotTemporarilyUnavailable,
     /// so raft state machine could know that Storage needs some time to prepare
     /// snapshot and call snapshot later.
+    ///
+    /// 返回最新的快照
+    ///
+    /// 如果快照临时不可用（可能传输了一部分），那么应该返回SnapshotTemporarilyUnavailable，
+    /// 这样raft状态机就能够直到Storage需要时间去准备snapshot，然后可以稍后调用这个方法
     fn snapshot(&self) -> Result<Snapshot>;
 }
 

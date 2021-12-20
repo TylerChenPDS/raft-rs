@@ -34,7 +34,14 @@ use eraftpb::{Entry, Snapshot};
 /// position in storage; this means that the next write to storage
 /// might need to truncate the log before persisting unstable.entries.
 ///
+/// unstable.offset成员保存的是entries数组中的第一条数据在raft日志中的索引，
+/// entries[i] 在raft日志中的索引位置为 log[i+unstable.offset]
+///
+/// 注意：unstable.offset可能比存储中日志最高的索引小，这意味着持久化unstable.entries之前，下次写入存储的时候需要进行截断操作。
+///
 /// 顾名思义，unstable数据结构用于还没有被用户层持久化的数据
+///
+/// 这两个部分，并不同时存在，同一时间只有一个部分存在。
 #[derive(Debug, PartialEq, Default)]
 pub struct Unstable {
     /// The incoming unstable snapshot, if any.
@@ -63,6 +70,8 @@ impl Unstable {
 
     /// Returns the index of the first possible entry in entries
     /// if it has a snapshot.
+    ///
+    /// 如果快照存在的话，返回 snapshot.Metadata.Index + 1
     pub fn maybe_first_index(&self) -> Option<u64> {
         self.snapshot
             .as_ref()
@@ -70,6 +79,8 @@ impl Unstable {
     }
 
     /// Returns the last index if it has at least one unstable entry or snapshot.
+    ///
+    /// 如果快照不为空，则返回snapshot.Metadata.Index，否则返回u.offset + len(entries) - 1，也就是说返回raft 最后一个日志条目的下标
     pub fn maybe_last_index(&self) -> Option<u64> {
         match self.entries.len() {
             0 => self
@@ -81,6 +92,14 @@ impl Unstable {
     }
 
     /// Returns the term of the entry at index idx, if there is any.
+    ///
+    /// 给定index的entry，返回它的term
+    ///
+    /// 如果i < offset， 说明这个日志要么在unstable里面的快照里面，要么在raft已经持久化的日志里面，
+    /// 前者我们只知道快照里面最后一个日志条目的任期，后者不应该在unstable里面查询，
+    ///
+    /// 如果是i < offset的情况，只有u.snapshot != nil && u.snapshot.Metadata.Index == i 我们才知道其任期：u.snapshot.Metadata.Term。
+    /// 如果i > offset，我们需要在entries里面找到对应位置的日志返回其任期u.entries[idx-u.offset].Term(注意这个i指的是，在raft log中的索引)
     pub fn maybe_term(&self, idx: u64) -> Option<u64> {
         if idx < self.offset {
             let snapshot = self.snapshot.as_ref()?;
@@ -102,6 +121,10 @@ impl Unstable {
 
     /// Moves the stable offset up to the index. Provided that the index
     /// is in the same election term.
+    ///
+    /// 该函数传入一个索引号i和任期号t，表示应用层已经将这个索引之前的数据进行持久化了，
+    /// 此时unstable要做的事情就是在自己的数据中查询，只有在满足任期号相同以及i大于等于offset的情况下，
+    /// 可以将entries中的数据进行缩容，将i之前的数据删除。
     pub fn stable_to(&mut self, idx: u64, term: u64) {
         let t = self.maybe_term(idx);
         if t.is_none() {
@@ -116,6 +139,9 @@ impl Unstable {
     }
 
     /// Removes the snapshot from self if the index of the snapshot matches
+    ///
+    /// 该函数传入一个索引i，用于告诉unstable，索引i对应的快照数据已经被应用层持久化了，如果这个索引与当前快照数据对应的上，
+    /// 那么快照数据就可以被置空了。
     pub fn stable_snap_to(&mut self, idx: u64) {
         if self.snapshot.is_none() {
             return;
@@ -126,6 +152,8 @@ impl Unstable {
     }
 
     /// From a given snapshot, restores the snapshot to self, but doesn't unpack.
+    ///
+    /// 将Unstable 里面的快照设置为给定的快照
     pub fn restore(&mut self, snap: Snapshot) {
         self.entries.clear();
         self.offset = snap.get_metadata().get_index() + 1;
@@ -133,6 +161,9 @@ impl Unstable {
     }
 
     /// Append entries to unstable, truncate local block first if overlapped.
+    ///
+    /// 传入日志条目数组，这段数据将添加到entries数组中。但是需要注意的是，传入的数据跟现有的entries数据可能有重合的部分，
+    /// 所以需要根据unstable.offset与传入数据的索引大小关系进行处理，有些数据可能会被截断。
     pub fn truncate_and_append(&mut self, ents: &[Entry]) {
         let after = ents[0].get_index();
         if after == self.offset + self.entries.len() as u64 {
@@ -169,6 +200,8 @@ impl Unstable {
 
     /// Asserts the `hi` and `lo` values against each other and against the
     /// entries themselves.
+    ///
+    /// 检查传入的数据索引范围是否合理，u.offset <= lo <= hi <= u.offset+len(u.entries)。
     pub fn must_check_outofbounds(&self, lo: u64, hi: u64) {
         if lo > hi {
             panic!("{} invalid unstable.slice {} > {}", self.tag, lo, hi)

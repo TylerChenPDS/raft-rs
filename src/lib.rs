@@ -390,8 +390,8 @@ mod log_unstable;
 mod progress;
 #[cfg(test)]
 pub mod raft;
-#[cfg(not(test))]
-mod raft;
+// #[cfg(not(test))]
+// mod raft;
 mod raft_log;
 pub mod raw_node;
 mod read_only;
